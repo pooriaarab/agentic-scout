@@ -1,197 +1,67 @@
 #!/usr/bin/env node
-import { readFileSync, realpathSync } from "node:fs";
 import { pathToFileURL } from "node:url";
-import {
-  dispatchText,
-  getCostReport,
-  GuardError,
-  LocalRouterAdapter,
-  summarizeText,
-  VendorError,
-  type RouterAdapter,
-} from "./core.js";
+import { realpathSync } from "node:fs";
+import { createGuards, getCostReport, GuardError, VendorError, summarizeText, dispatchText, LocalRouterAdapter } from "./core.js";
+import { searchThreads, rankThreads, suggestIdeas, type ScoutSource } from "./scout.js";
 import { DEFAULT_BRAND } from "./index.js";
 import { VERSION } from "./version.js";
 
-export class UsageError extends Error {
-  constructor(message: string) {
-    super(message);
-    this.name = "UsageError";
-  }
-}
-
-export type CliCommand = "summary" | "dispatch" | "costs" | "mcp" | "help" | "version";
-
-export interface CliRequest {
-  command: CliCommand;
-  text?: string;
-  file?: string;
-  dryRun: boolean;
-  topN?: number;
-}
+export class UsageError extends Error { constructor(message: string) { super(message); this.name = "UsageError"; } }
+export type CliCommand = "search" | "trends" | "ideas" | "summary" | "dispatch" | "costs" | "mcp" | "help" | "version";
+export interface CliRequest { command: CliCommand; query?: string; platforms?: ScoutSource[]; dryRun: boolean; text?: string; file?: string; topN?: number; }
+export interface CliIo { out(line: string): void; err(line: string): void; fetchFn?: typeof fetch; readFile?(path: string): string; router?: unknown; }
 
 export function parseArgs(argv: string[]): CliRequest {
   const request: CliRequest = { command: "help", dryRun: false };
-  const args = [...argv];
-  const first = args.shift();
-  if (first === undefined || first === "--help" || first === "-h") {
-    return request;
-  }
-  if (first === "--version" || first === "-V") {
-    request.command = "version";
-    return request;
-  }
-  if (first !== "summary" && first !== "dispatch" && first !== "costs" && first !== "mcp") {
-    throw new UsageError(`unknown command "${first}"`);
-  }
-  request.command = first;
-  while (args.length > 0) {
+  const args = [...argv]; const first = args.shift();
+  if (first === undefined || first === "--help" || first === "-h") return request;
+  if (first === "--version" || first === "-V") return { ...request, command: "version" };
+  if (!["search", "trends", "ideas", "summary", "dispatch", "costs", "mcp"].includes(first)) throw new UsageError(`unknown command "${first}"`);
+  request.command = first as CliCommand;
+  while (args.length) {
     const flag = args.shift() as string;
-    if (flag === "--dry-run" && request.command === "dispatch") {
-      request.dryRun = true;
-      continue;
-    }
-    if ((flag === "--text" || flag === "--file" || flag === "--top") && args.length > 0) {
+    if (flag === "--live") { request.dryRun = false; continue; }
+    if (flag === "--dry-run") { request.dryRun = true; continue; }
+    if ((flag === "--text" || flag === "--file" || flag === "--top") && args.length) { const value = args.shift() as string; if (flag === "--text") request.text = value; else if (flag === "--file") request.file = value; else { const n = Number.parseInt(value, 10); if (!Number.isInteger(n) || n < 0) throw new UsageError(`--top needs an integer of 0 or more, got "${value}"`); request.topN = n; } continue; }
+    if ((flag === "--query" || flag === "--platforms") && args.length) {
       const value = args.shift() as string;
-      if (flag === "--text") request.text = value;
-      if (flag === "--file") request.file = value;
-      if (flag === "--top") {
-        const topN = Number.parseInt(value, 10);
-        if (!Number.isInteger(topN) || topN < 0) {
-          throw new UsageError(`--top needs an integer of 0 or more, got "${value}"`);
-        }
-        request.topN = topN;
+      if (flag === "--query") request.query = value;
+      else {
+        const valid: ScoutSource[] = ["reddit", "hackernews", "rss", "fixture"];
+        const platforms = value.split(",").map((v) => v.trim()).filter(Boolean) as ScoutSource[];
+        if (platforms.some((platform) => !valid.includes(platform))) throw new UsageError("--platforms supports reddit,hackernews,rss,fixture");
+        request.platforms = platforms;
       }
       continue;
     }
     throw new UsageError(`unknown flag "${flag}" for "${request.command}"`);
   }
-  if (
-    (request.command === "summary" || request.command === "dispatch") &&
-    request.text === undefined &&
-    request.file === undefined
-  ) {
-    throw new UsageError(`${request.command} needs --text or --file`);
-  }
+  if (["summary", "dispatch"].includes(request.command) && !request.text && !request.file) throw new UsageError(`${request.command} needs --text or --file`);
+  if (["search", "ideas"].includes(request.command) && !request.query) throw new UsageError(`${request.command} needs --query`);
   return request;
 }
-
-export interface CliIo {
-  out(line: string): void;
-  err(line: string): void;
-  readFile(path: string): string;
-  router: RouterAdapter;
-}
-
-function defaultIo(): CliIo {
-  return {
-    out: (line) => console.log(line),
-    err: (line) => console.error(line),
-    readFile: (path) => readFileSync(path, "utf8"),
-    router: new LocalRouterAdapter(),
-  };
-}
-
-function helpText(): string {
-  const command = DEFAULT_BRAND.command;
-  return [
-    `${DEFAULT_BRAND.name} ${VERSION}`,
-    `${DEFAULT_BRAND.description}`,
-    "",
-    `Usage: ${command} <command> [flags]`,
-    "",
-    "Commands:",
-    "  summary --text <t> [--file <p>] [--top <n>]  Print text stats as JSON.",
-    "  dispatch --text <t> [--file <p>] [--dry-run] Route one text, print the receipt.",
-    "  costs                                      Print the cost report as JSON.",
-    "  mcp                                        Start the MCP server on stdio.",
-    "",
-    "Flags:",
-    "  --help, -h       Print this help.",
-    "  --version, -V    Print the version.",
-  ].join("\n");
-}
-
-function readInput(request: CliRequest, io: CliIo): string {
-  if (request.file !== undefined) {
-    return io.readFile(request.file);
-  }
-  return request.text ?? "";
-}
-
+function helpText(): string { return `${DEFAULT_BRAND.name} ${VERSION}\n${DEFAULT_BRAND.description}\n\nUsage: agentic-scout <command> [flags]\n\nCommands:\n  search --query <q> [--platforms reddit,hackernews] [--live]\n  trends [--platforms reddit,hackernews] [--live]\n  ideas --query <q> [--platforms reddit,hackernews] [--live]\n  costs\n  mcp\n\nDry-run is the default. Use --live only after approval; live searches use public APIs.`; }
+function defaultIo(): CliIo { return { out: (line) => console.log(line), err: (line) => console.error(line) }; }
 export async function runCli(argv: string[], io: CliIo = defaultIo()): Promise<number> {
   let request: CliRequest;
+  try { request = parseArgs(argv); } catch (error) { io.err(error instanceof Error ? error.message : String(error)); return 2; }
   try {
-    request = parseArgs(argv);
+    if (request.command === "help") { io.out(helpText()); return 0; }
+    if (request.command === "version") { io.out(VERSION); return 0; }
+    if (request.command === "summary") { const text = request.file ? io.readFile?.(request.file) ?? "" : request.text ?? ""; io.out(JSON.stringify(summarizeText(text, { topN: request.topN }))); return 0; }
+    if (request.command === "dispatch") { const text = request.file ? io.readFile?.(request.file) ?? "" : request.text ?? ""; io.out(JSON.stringify(await dispatchText(text, { adapter: io.router instanceof LocalRouterAdapter ? io.router : new LocalRouterAdapter(), dryRun: request.dryRun }))); return 0; }
+    if (request.command === "costs") { io.out(JSON.stringify(getCostReport())); return 0; }
+    if (request.command === "mcp") { const { startMcp } = await import("./mcp.js"); await startMcp(); return 0; }
+    const query = request.command === "trends" ? "trending" : request.query as string;
+    const scoutDryRun = request.dryRun || !argv.includes("--live");
+    if (scoutDryRun) { io.out(JSON.stringify({ dryRun: true, query, sources: request.platforms ?? ["reddit", "hackernews"], approvalRequired: true })); return 0; }
+    const threads = await searchThreads(query, request.platforms ?? ["reddit", "hackernews"], { fetchFn: io.fetchFn, guards: createGuards() });
+    io.out(JSON.stringify(request.command === "ideas" ? suggestIdeas(threads) : rankThreads(threads)));
+    return 0;
   } catch (error) {
-    io.err(error instanceof Error ? error.message : String(error));
-    io.err(`Run "${DEFAULT_BRAND.command} --help" for usage.`);
-    return 2;
-  }
-  try {
-    switch (request.command) {
-      case "help":
-        io.out(helpText());
-        return 0;
-      case "version":
-        io.out(VERSION);
-        return 0;
-      case "summary": {
-        const summary = summarizeText(readInput(request, io), { topN: request.topN });
-        io.out(JSON.stringify(summary));
-        return 0;
-      }
-      case "dispatch": {
-        const result = await dispatchText(readInput(request, io), {
-          adapter: io.router,
-          dryRun: request.dryRun,
-        });
-        io.out(JSON.stringify(result));
-        return 0;
-      }
-      case "costs":
-        io.out(JSON.stringify(getCostReport()));
-        return 0;
-      case "mcp": {
-        const { startMcp } = await import("./mcp.js");
-        await startMcp();
-        return 0;
-      }
-    }
-  } catch (error) {
-    if (error instanceof GuardError || error instanceof VendorError || error instanceof UsageError) {
-      io.err(`${error.name}: ${error.message}`);
-      return 1;
-    }
-    if (error instanceof Error && "code" in error && error.code === "ENOENT") {
-      io.err(`file not found: ${request.file ?? ""}`);
-      return 1;
-    }
+    if (error instanceof GuardError || error instanceof VendorError) { io.err(`${error.name}: ${error.message}`); return 1; }
     throw error;
   }
 }
-
-function isMainModule(): boolean {
-  const invoked = process.argv[1];
-  if (typeof invoked !== "string") return false;
-  try {
-    return import.meta.url === pathToFileURL(realpathSync(invoked)).href;
-  } catch {
-    return false;
-  }
-}
-
-if (isMainModule()) {
-  runCli(process.argv.slice(2)).then(
-    (code) => {
-      // Exit nonzero at once. On zero, fall off the end so a running
-      // server (mcp) keeps its stdio handles open. Plain commands
-      // hold no handles and exit 0 on their own.
-      if (code !== 0) process.exit(code);
-    },
-    (error: unknown) => {
-      console.error(error instanceof Error ? error.message : String(error));
-      process.exit(1);
-    },
-  );
-}
+function isMainModule(): boolean { try { return typeof process.argv[1] === "string" && import.meta.url === pathToFileURL(realpathSync(process.argv[1])).href; } catch { return false; } }
+if (isMainModule()) runCli(process.argv.slice(2)).then((code) => { if (code) process.exit(code); }, (error: unknown) => { console.error(error instanceof Error ? error.message : String(error)); process.exit(1); });
