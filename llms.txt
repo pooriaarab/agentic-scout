@@ -1,0 +1,15 @@
+# agentic-scout
+
+Find relevant threads and viral content ideas across social platforms.
+
+Keywords: social,discovery,trends,reddit,viral,agentic-suite,cli,mcp.
+
+- SDK: import { summarizeText, dispatchText } from "agentic-scout".
+- CLI: agentic-scout summary --text "...".
+- MCP: run agentic-scout mcp, then call summarize_text.
+
+## Docs
+
+- README: https://github.com/pooriaarab/agentic-scout
+- Core contract: https://github.com/pooriaarab/agentic-scout/blob/main/docs/agentic-core.md
+- License: MIT
