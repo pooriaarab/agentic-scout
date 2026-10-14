@@ -18,13 +18,38 @@ describe("mcp server", () => {
     try {
       const tools = await client.listTools();
       const names = tools.tools.map((tool) => tool.name).sort();
-      expect(names).toEqual(["dispatch_text", "get_cost_report", "summarize_text"]);
+      expect(names).toEqual([
+        "dispatch_text",
+        "get_cost_report",
+        "rank_threads",
+        "score_opportunity",
+        "search_threads",
+        "suggest_ideas",
+        "summarize_text",
+      ]);
 
       const summary = await client.callTool({
         name: "summarize_text",
         arguments: { text: "a b a" },
       });
       expect(JSON.parse(textOf(summary))).toMatchObject({ words: 3 });
+
+      const scored = await client.callTool({
+        name: "score_opportunity",
+        arguments: {
+          thread: {
+            id: "t1",
+            source: "reddit",
+            title: "Best tacos in Austin?",
+            body: "Where can I find the best tacos near me?",
+            url: "https://example.com/t1",
+            score: 42,
+            comments: 18,
+            tags: ["best", "near me"],
+          },
+        },
+      });
+      expect(JSON.parse(textOf(scored))).toHaveProperty("total");
 
       const preview = await client.callTool({
         name: "dispatch_text",
